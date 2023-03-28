@@ -1,0 +1,187 @@
+---
+title: "Ukázka optimalizace meta tagů v R za pomoci OpenAI"
+format: html
+editor: visual
+---
+
+# Optimalizace meta tagů za využití OpenAI
+
+Tento Quarto Document vznikl jako ukázka kódu pro práci s OpenAI v R v rámci konference SEO Restart. Jedná se pouze o příklad a modifikace je možná pro konkrétní příklady. V případě dorazů mě můžete kontaktovat na lukas.kostka\@effectix.com.
+
+## Instalace knihoven
+
+Pokud ještě nemáte nainstalované balíčky, které jsou nutné k práci, můžete tak učinit zde
+
+```{r}
+install.packages(c("googleAuthR", "searchConsoleR", "lubridate", "urltools", "tidyverse", "readxl", "writexl", "rvest", "openai", "purrr"))
+```
+
+## Načtení knihoven
+
+```{r}
+library(googleAuthR)
+library(searchConsoleR)
+library(lubridate)
+library(urltools)
+library(tidyverse)
+library(readxl)
+library(writexl)
+library(rvest)
+library(openai)
+library(purrr)
+```
+
+## Přihlášení do účtu
+
+```{r}
+googleAuthR::gar_auth()
+```
+
+## Načtení seznamu webů v účtu
+
+```{r}
+list_websites()
+```
+
+## Stažení dat z GSC účtu
+
+Nejprve je nutné vybrat doménu přiřazenou do vašeho účtu. Pomocí startDate a endDate vyberte počátek a konec analyzovaného období. Pro přesnější výsledky je vhodné vyfiltrovat cílovou zemi, případně vyloučit brandové výrazy.
+
+```{r}
+my_site = "URL_klient"
+scdata <- search_analytics(
+  siteURL = my_site,
+  startDate = today() - 92,
+  endDate = today() - 3,
+  dimensions = c("query", "page"),
+  dimensionFilterExp = c("country==CZE", "query!~brand_vylouceni"),
+  rowLimit = 20000
+  )
+```
+
+## Nalezení LP pro optimalizaci
+
+Následující částí kódu vytipujeme landing pages, které bychom mohli optimalizovat. Data je možné filtrovat dle počtu kliknutí či impresí.
+
+```{r}
+potential_urls <-  scdata |>
+  filter(position < 5) |>
+  filter(impressions > 100) |>
+  mutate(score = position*ctr*100) |>
+  group_by(page) |> 
+  summarise(score_sum = sum(score)) |>
+  arrange(score_sum)
+```
+
+Výběr počtu URL, které chci optimalizovat
+
+```{r}
+pocet_url <- 4
+url_data <- head(potential_urls$page, pocet_url) |> 
+  as.data.frame() |> 
+  rename("url" = 1)
+texty_df <- data.frame(url = character(nrow(url_data)),
+                       text = character(nrow(url_data)),
+                       title = character(nrow(url_data)),
+                       description = character(nrow(url_data)))
+
+for (i in 1:nrow(url_data)) {
+  url <- url_data[i,1]
+  web_stranka <- read_html(url)
+
+  # Použijte xpath k vybrání textu z webové stránky
+  text <- web_stranka  |> 
+    html_nodes('p')  |> 
+    html_text2(preserve_nbsp = TRUE) |> 
+    paste(collapse = " ")
+  title <- web_stranka  |> 
+    html_node("title") |> 
+    html_text2(preserve_nbsp = TRUE)
+  description <- web_stranka  |> 
+    html_node("meta[name='description']")  |> 
+    html_attr("content")
+  
+  if (length(text) == 0) {
+    text <- "null"
+  }
+
+  # Uložte URL a vyscrapovaný text do dataframu
+  texty_df[i, "url"] <- url
+  texty_df[i, "text"] <- text
+  texty_df[i, "title"] <- title
+  texty_df[i, "description"] <- description
+}
+
+```
+
+## Agregace dat s příslušnými LP a KWS, na která budeme optimalizovat
+
+```{r}
+url_data <- head(potential_urls$page, pocet_url) |> 
+  as.data.frame() |> 
+  rename("url" = 1)
+
+agg_df <- scdata  |>
+  filter(position < 10) |>
+  filter(impressions > 50) |>
+  mutate(score = ctr * position * 100) |> 
+  group_by(page) |> 
+  arrange(score) |> 
+  slice(1:5) |> 
+  select(page, query) |> 
+  group_by(page) |> 
+  summarize(query = paste(query, collapse = ", "))
+
+  url_data <- url_data  |> 
+  left_join(agg_df, by = c("url" = "page"))
+  url_data <- url_data  |> 
+  left_join(texty_df, by = c("url" = "url"))
+```
+
+## Generování meta tagů přes ChatGPT API
+
+Výchozí prompt je vhodné optimalizovat na základě potřeby. Při optimalizaci promptu doporučuji využít Platform OpenAI - experimentovat je možné například i s parametrem temperature, který vyjadřuje míru ‚‚kreativity\'\'. V příkladu je ukázáno využití tzv. one-shot-learningu. Možné je však vyzkoušet rovněž few-shot-learning či případně vytrénovat vlastní model.
+
+```{r}
+Sys.setenv(OPENAI_API_KEY = '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')
+web <-  "Gutta"
+url_data$meta_title <- NA
+url_data$meta_description <- NA
+
+for (i in seq_len(nrow(url_data))) {
+  url <- url_data[i, "url"]
+  queries <- url_data[i, "query"]
+  text <- url_data[i, "text"]
+  
+
+  initPrompt <- "Napiš meta title a meta description, z textu získej kontext a použiješ zadaná klíčová slova. Do meta title vlož název webu za znak |. Do meta descriptionu napiš call to action. Maximální délka meta titlu je 60 znaků a meta descriptionu 160 znaků. Příklad pro web Mobilář. Klíčová slova: příslušenství pro telefony, powerbanky, selfie tyče, nabíječky Text: Mobilní telefony k sobě mají celou řadu příslušenství, které zlepšuje jejich používání. Naprosto nezbytná je baterie do mobilních telefonů a nabíječka. Velmi žádaná jsou také sluchátka, powerbanky nebo selfie tyč. Zajímavá je také nabídka SIM karet a paměťových karet, které rozšiřují paměť mobilního telefonu. Aby se mobil třeba při pádu nerozbil nebo nepoškrábal, jsou žádané ochranné fólie a tvrzená skla nebo rovnou pouzdra na mobilní telefon. Co všechno najdete v příslušenství pro mobilní telefony? \nMeta title: Příslušenství pro telefony | Mobilář\nMeta description: Powerbanky, selfie tyče nebo nabíječky? Nejlevnější a originální příslušenství najdete u nás!"
+   prompt <- paste0(initPrompt, "\n\nWeb: ", web, "\n", "Klíčová slova: ", queries, "\nText: ", text)
+  
+  
+  result <- create_chat_completion(
+    model = 'gpt-3.5-turbo', 
+    max_tokens = 200,
+    temperature = 1,
+    messages = list(list(
+           "role" = "user",
+           "content" = prompt
+       ))
+  )
+  
+  result <- result$choices$message.content
+  result <- unlist(strsplit(result, "Meta description: "))
+  meta_title <- gsub("Meta title: ", "", result[[1]])
+  meta_description <- result[[2]]
+  
+
+url_data[i, "meta_title"] <- meta_title
+url_data[i, "meta_description"] <- meta_description
+}
+```
+
+## Export dat do Excelu
+
+```{r}
+library(writexl)
+write_xlsx(url_data,"generated_tags.xlsx")
+```
